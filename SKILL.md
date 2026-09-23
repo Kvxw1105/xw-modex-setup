@@ -88,9 +88,9 @@ up.mingheng.xin         软件更新
 - 把 Anthropic Messages 转成 OpenAI Chat Completions（若上游是 openai 协议）
 - 按配置转发到上游池
 
-### 步骤 4 · 配上游池 + 凭据库
+### 步骤 4 · 配上游池 + 凭据库 + **Modex 侧模型配置**
 
-**建凭据库**（推荐 JSON，一个文件管所有站）：
+**4.1 建凭据库**（推荐 JSON，一个文件管所有站）：
 
 ```json
 {
@@ -99,7 +99,7 @@ up.mingheng.xin         软件更新
       "name": "例子站",
       "base_url": "https://api.example.com/v1",
       "api_key": "sk-...",
-      "kind": "openai",
+      "kind": "anthropic",
       "inject_headers": {"User-Agent": "claude-cli/2.1.132 (external, cli)"},
       "models": ["model-a", "model-b"],
       "observed": {"at": "2026-01-01T00:00", "usable": ["model-a"], "latency_s": 1.2}
@@ -108,15 +108,42 @@ up.mingheng.xin         软件更新
 }
 ```
 
-**四条配置原则**：
+**4.2 四条池配置原则**：
 
 1. **池按实测延迟升序排** —— 主用最快的，不是最贵的
 2. **只把「实测可用」的模型放进映射表** —— 列表里有 ≠ 能用
 3. **model_map 要覆盖两类名字**：
-   - Modex 实际发出的名字（如 `claude-fable-5`）
+   - 软件实际发出的名字（如 `claude-fable-5`）
    - 目标站的真实模型名（**自映射**，如 `claude-opus-5 -> claude-opus-5`）
    - **漏了自映射会导致：请求被原样透传 → 上游不认 → 池子跳站到别处**
-4. **开启故障转移** —— 某站限流/失败自动切下一个
+   - **注意实现陷阱**：用 `m[k]=k` 覆盖，不要用 `setdefault` ——
+     否则自映射被 default 占位符挡住，导致"要 A 却给了 B"的静默错误
+4. **开故障转移**
+
+**4.3 配 Modex 侧（关键，见 K9）**
+
+Modex 有五套独立的模型端点，**分两种配置形态**：
+
+| 形态 | 接口 | 字段 |
+|---|---|---|
+| **preset（推荐）** | `POST /api/settings/presets` | `{name, model_id, api_key}` |
+| 扁平字段 | `PUT /api/settings` | `executor_api_key` / `_model_id` 等 |
+
+**硬规则（否则必 401）**：
+- Modex 侧填 **官方 key + 官方 base_url**
+- **`*_base_url` 后端不接收**（写了会静默丢弃），所以只能靠 hosts 接管
+- 第三方站的 key **不要填进 Modex**，交给代理层替换
+
+```python
+# 正确示例（照做）
+PUT /api/settings
+{"settings": {
+  "executor_base_url": "https://www.mhcoding.ai/",   # 官方域名（本地校验用）
+  "executor_api_key":  "<官方 key>",                  # 官方 key（本地校验用）
+  "executor_model_id": "claude-fable-5"
+}}
+# 代理层负责把上面这个 key 换成中转站的
+```
 
 ### 步骤 5 · 验证（用脚本，不靠观察）
 
@@ -194,6 +221,89 @@ hosts 指着 127.0.0.1，但 443 没人监听 → 每条模型请求都连接失
 
 除 hosts 外，其余（装证书、绑 443）都**不需要**管理员。
 把提权集中在 `写 hosts` 这一个动作上。
+
+### K9 · Modex 有本地 key↔base_url 归属校验 —— **最容易致命的一条**
+
+**症状**：`POST /api/settings/test/{executor,reviewer,editor_ai}` 全返回
+```
+HTTP 401 This API key does not belong to MHcoding.
+Check that your key and Base URL come from the same site
+```
+
+**误判风险**：看起来像"网络问题/上游拒绝"，实则是 **Modex 本地就拒了，请求根本没发出去**。
+
+**判别法（三步，缺一不可）**：
+```powershell
+# 1. 抓后端进程的外部连接（测试期间）
+Get-NetTCPConnection -OwningProcess <后端pid> -State Established |
+  Where-Object { $_.RemoteAddress -ne '127.0.0.1' }
+# 2. 查代理日志有没有新记录
+Get-Content proxy\logs\proxy.jsonl -Tail 5
+# 3. 关掉系统代理重测，看是否变化
+```
+**若三步都是"无外部连接 + 代理日志无新增 + 关代理无变化" → 就是本地校验拒绝，不是网络问题。**
+
+**正确配置范式（关键）**：
+```
+Modex 侧填：官方 key + 官方 base_url（如 https://www.mhcoding.ai/）→ 本地校验通过
+代理侧：    把官方 key 替换成中转站 key（intercept_server 有替换逻辑）
+真实上游：  收到中转站 key，正常服务
+```
+
+**禁止**：直接在 Modex 里填第三方站点的 key —— 会被本地校验拒绝。
+**不要**听从"把 key 换掉试试"的直觉，那正是错的。
+
+**验证通过的样子**：
+```json
+{"ok": true, "message": "Hello.", "agent": "executor"}
+```
+注意那个 "Hello" 来自**你的中转站**（官方 key 通常已无额度），
+这同时证明了 key 替换链路成立。
+
+### K10 · 能原生就原生：先探 `/v1/messages`
+
+**动手前先探**：上游若支持 Anthropic 原生接口，就设 `upstream_kind: anthropic`，
+**零转换**。只有不支持时才用 `openai`（需协议转换）。
+
+```python
+# 探法
+POST {base_url}/v1/messages
+  headers: {"x-api-key": key, "anthropic-version": "2023-06-01"}
+  body: {"model": "...", "max_tokens": 64, "tools": [...], "messages": [...]}
+# 200 且 content 里出现 tool_use → 原生可用
+```
+
+**转换的实际代价**（实测差异）：
+| 环节 | 原生 | 转 OpenAI 后 |
+|---|---|---|
+| prompt cache | `cache_creation_input_tokens` 可见可透传 | **字段不存在，直接丢失** |
+| 工具配对 | `tool_use` block 原样 | 要映射 `tool_calls`，**id 配对有 400 风险** |
+| 响应字段 | `service_tier` / `inference_geo` 等保留 | 丢失 |
+
+**判别响应是不是原生**：看 usage 里有没有
+`cache_creation_input_tokens`、`ephemeral_5m_input_tokens`、`service_tier`。
+**有 = 原生直连；没有 = 走了转换。**
+
+### K11 · 代理的 header 注入是必需项，不是可选项
+
+**实测现象**：同一个站、同一个 key，**直连 403，经代理 200**。
+
+原因：代理注入的 `User-Agent: claude-cli/2.1.132 (external, cli)` 是关键伪装，
+代表"合法 Claude 客户端"。直连用默认 UA 会被上游拒绝。
+
+**推论**：上游的准入判断**不只看 key，还看客户端指纹**。
+所以 `inject_headers` 必须配，且**要用像真客户端的 UA**。
+
+### K12 · 部分上游按 credit 计费，不是按 token
+
+某些站的响应里带非标准字段，暴露了它的底层通道：
+```
+"kiro_credits": 0.027, "kiro_total_ms": 2077, "kiro_actual_input_tokens": 6062
+```
+→ 底层是 **Kiro（AWS AI IDE）** 通道，**按 credit 计费**。
+
+**含义**：官方标注的"按 token"单价不适用，**成本要按 credit 估算**。
+**排查建议**：跑一个阶段后，去各站后台对余额消耗，倒推单篇成本。
 
 ## 验收标准
 
