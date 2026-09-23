@@ -305,6 +305,114 @@ POST {base_url}/v1/messages
 **含义**：官方标注的"按 token"单价不适用，**成本要按 credit 估算**。
 **排查建议**：跑一个阶段后，去各站后台对余额消耗，倒推单篇成本。
 
+### K13 · Claude CLI 继承宿主代理变量 —— **最隐蔽、最难定位**
+
+**症状**：Modex 的「测试连接」**通过**（三角色 `ok:true "Hello"`），
+但开会话 / 跑任务时 **503 + 一个陌生分组名**：
+```
+503 No available channel for model <X> under group <某分组名> (distributor)
+```
+
+**根因**：新版 Modex 用 **Claude CLI 子进程**执行任务。该子进程
+**继承宿主进程的 `HTTP_PROXY` / `HTTPS_PROXY`**。若这两个变量指向本地
+代理（Clash/V2Ray 的 `127.0.0.1:7897`），CLI 请求**优先走代理** →
+**绕过 hosts 劫持** → 打到真实站点。
+
+**为什么难查**（实测绕了几小时）：
+- 443 代理日志**零记录** → 看起来"请求没发出去"
+- 全机抓包 90 秒**零外部连接** → 更深地误判
+- 错误里的"分组名"来自真站 → 误以为是自己 key/分组配错
+
+**三步定位法**：
+```
+1. 读后端进程环境块（PEB），确认 HTTP_PROXY/HTTPS_PROXY 是否存在
+2. 对比实验：直接用真 claude.exe 跑两次
+     A 带 HTTPS_PROXY → 复现 503
+     B 清掉 HTTPS_PROXY → 应成功
+3. 读父进程环境 —— 变量会一路继承到桌面/终端
+```
+
+**修法**：**从「清掉代理变量」的环境启动 Modex**
+```powershell
+$env:HTTP_PROXY=''; $env:HTTPS_PROXY=''; $env:ALL_PROXY=''
+Start-Process "D:\App\Modex-MH-Agent-2\Modex-MH-Agent.exe"
+```
+**不要**改系统级环境变量（会影响其他软件）。
+**替代方案**：把接管域名加进系统代理的 `ProxyOverride` 例外列表。
+
+**实测证据**（同一 exe、同一 key）：
+```
+A 带 HTTPS_PROXY   → 222.3s，503 "Grok Build to claude"
+B 清掉 HTTPS_PROXY → 19.3s，退出码 0，输出 "PONG"
+```
+
+### K14 · 协同模式的接口是 `PATCH /mode`，不是 `chat/config`
+
+**症状**：`/api/workflows/{id}/chat/config` 返回
+`409 这个工作流不是协同模式，请先在工作流详情页切换模式`。
+
+**误判**：以为只能通过 GUI 切换。
+
+**真相**（在 `workflowStore.setWorkflowMode` 里）：
+```
+PATCH /api/workflows/{id}/mode
+body: {"chat_mode": true}          ← 布尔值，不是字符串
+→ 200 {"status": "updated", "chat_mode": true}
+```
+
+**三条关键认知**：
+- `chat/config` 是**只读**的，不能用它切模式
+- 建卡接口 **不接收 `chat_mode`** —— 传了会被静默丢弃
+  （params 里只留 `_execution_identity`）
+- 协同模式必须**建卡后单独 PATCH /mode**
+
+**绑模型**也要带 `interaction_mode`（否则 422）：
+```
+PATCH /api/workflows/{id}/chat/config
+body: {"model_preset_id": "<id>", "interaction_mode": "auto"}
+```
+
+### K15 · Modex 侧的模型名必须是「兼容名」
+
+**症状**：开会话 503，错误里出现**你没配过的模型名**（如 `claude-opus-4-7`）。
+
+**根因**：Claude CLI 只认**它自己的兼容模型名**（如 `claude-fable-5`），
+再按内部映射表转成真实模型。直接填真实名（`claude-opus-5`）它不认。
+
+**修法（两全其美）**：
+```
+Modex preset 填「兼容名」  claude-fable-5                    ← CLI 认
+代理 model_map 做映射      claude-fable-5 → claude-opus-5     ← 上游收到真名
+```
+
+**判别**：读 CLI 的 `.claude.json`，看
+`tengu_auto_mode_config.modelByMainModel` —— 它列出了 CLI 认识的主模型名。
+
+### K16 · 消息状态机与驱动顺序
+
+**症状**：`say` 返回 200 但任务不执行；`confirm` 报
+`该提议状态为 pending，不能确认（只有 proposed 可以）`。
+
+**状态流转**：
+```
+pending    用户消息落库
+   ↓ say 触发 CLI 处理
+proposed   CLI 生成任务卡，等确认
+   ↓ confirm
+queued     入队 → running → done / failed
+```
+
+**完整驱动顺序（缺一不可）**：
+```python
+POST /chat/session                                        # 开会话（60~220s）
+POST /chat/say  {"text":..., "interaction_mode":"auto"}    # 发指令
+# 等 CLI 处理，直到出现 proposed
+POST /chat/messages/{mid}/confirm                         # 确认任务卡
+```
+
+**字段名注意**：`say` 用 **`text`**（不是 `message`），
+且**必须带 `interaction_mode`**（否则 422）。
+
 ## 验收标准
 
 - [ ] `setup_check.py` 退出码为 0（全部检查通过）
